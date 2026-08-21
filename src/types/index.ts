@@ -38,7 +38,10 @@ export type TokenStatus =
   | 'HELD'
   | 'COMPLETED'
   | 'SKIPPED'
-  | 'CANCELLED';
+  | 'CANCELLED'
+  | 'WAITLISTED'
+  | 'PROMOTED'
+  | 'EXPIRED';
 
 export interface Token {
   id: string;

@@ -18,7 +18,7 @@ def setup_test_db():
     """
     from app.database import initialize_schema, seed_database
     initialize_schema()
-    seed_database()
+    seed_database(force=True)
     yield
     # Cleanup test database file
     if os.path.exists("test_queuecraft.db"):

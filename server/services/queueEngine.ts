@@ -1,6 +1,6 @@
 import { getDb } from '../db/database.js';
 
-export type TokenStatus = 'WAITING' | 'SERVING' | 'HELD' | 'COMPLETED' | 'SKIPPED' | 'CANCELLED';
+export type TokenStatus = 'WAITING' | 'SERVING' | 'HELD' | 'COMPLETED' | 'SKIPPED' | 'CANCELLED' | 'WAITLISTED' | 'PROMOTED' | 'EXPIRED';
 
 export interface TokenRecord {
   id: string;
@@ -55,6 +55,8 @@ export interface IQueueEngine {
   getTokenPositionDetails(tokenId: string): { position: number; peopleAhead: number; estimatedWaitMinutes: number } | null;
   getWaitingQueueWithDetails(serviceId: string): TokenDetails[];
   promoteNextToken(serviceId: string, counterId: string): QueueEngineResult;
+  getWaitlistQueue(serviceId: string): TokenRecord[];
+  evaluateAndPromoteWaitlist(serviceId: string): { success: boolean; promotedTokens: TokenRecord[]; availableSlots: number; error?: string };
 }
 
 /**
@@ -69,6 +71,59 @@ export function getSortedWaitingTokens(serviceId: string): TokenRecord[] {
   const tokens = db.prepare(`
     SELECT * FROM tokens
     WHERE service_id = ? AND status = 'WAITING'
+  `).all(serviceId) as TokenRecord[];
+
+  const threshold = Number(process.env.PRIORITY_WAIT_THRESHOLD_MINUTES) || 15;
+  const now = new Date();
+
+  const getPriorityVal = (p: string) => {
+    switch (p) {
+      case 'URGENT': return 3;
+      case 'HIGH':
+      case 'PRIORITY': return 2;
+      case 'NORMAL':
+      default: return 1;
+    }
+  };
+
+  const getEffectivePriority = (token: TokenRecord) => {
+    const created = new Date(token.created_at);
+    const elapsedMinutes = Math.max(0, (now.getTime() - created.getTime()) / (60 * 1000));
+    const baseVal = getPriorityVal(token.priority);
+    const boost = Math.floor(elapsedMinutes / threshold);
+    return baseVal + boost;
+  };
+
+  const tokensWithKeys = tokens.map(t => ({
+    token: t,
+    effectivePriority: getEffectivePriority(t),
+    createdTime: new Date(t.created_at).getTime()
+  }));
+
+  tokensWithKeys.sort((a, b) => {
+    if (b.effectivePriority !== a.effectivePriority) {
+      return b.effectivePriority - a.effectivePriority;
+    }
+    if (a.createdTime !== b.createdTime) {
+      return a.createdTime - b.createdTime;
+    }
+    return a.token.id.localeCompare(b.token.id);
+  });
+
+  return tokensWithKeys.map(tk => tk.token);
+}
+
+/**
+ * Deterministic Fairness Policy for Waitlist Promotion:
+ * 1. Primary: Effective priority (Base priority + starvation aging factor)
+ * 2. Secondary: Waiting duration (Earlier created_at timestamp wins)
+ * 3. Tertiary: Stable unique ID (lexicographical comparison on token.id)
+ */
+export function getSortedWaitlistTokens(serviceId: string): TokenRecord[] {
+  const db = getDb();
+  const tokens = db.prepare(`
+    SELECT * FROM tokens
+    WHERE service_id = ? AND status = 'WAITLISTED'
   `).all(serviceId) as TokenRecord[];
 
   const threshold = Number(process.env.PRIORITY_WAIT_THRESHOLD_MINUTES) || 15;
@@ -177,6 +232,21 @@ export class DefaultQueueEngine implements IQueueEngine {
       return { position: 0, peopleAhead: 0, estimatedWaitMinutes: 0 };
     }
 
+    if (token.status === 'WAITLISTED') {
+      const waitlist = getSortedWaitlistTokens(token.service_id);
+      const idx = waitlist.findIndex(t => t.id === tokenId);
+      if (idx === -1) return null;
+
+      const peopleAhead = idx;
+      const position = idx + 1;
+      const avgServiceTime = this.getAverageServiceTime(token.service_id);
+      return {
+        position,
+        peopleAhead,
+        estimatedWaitMinutes: Math.round((position * avgServiceTime * 1.5) * 10) / 10
+      };
+    }
+
     if (token.status !== 'WAITING') {
       return { position: -1, peopleAhead: 0, estimatedWaitMinutes: 0 };
     }
@@ -233,7 +303,7 @@ export class DefaultQueueEngine implements IQueueEngine {
   }
 
   /**
-   * CREATE TOKEN Operation
+   * CREATE TOKEN Operation with automatic capacity/waitlist check
    */
   createToken(data: {
     student_name: string;
@@ -245,7 +315,7 @@ export class DefaultQueueEngine implements IQueueEngine {
   }): QueueEngineResult & { token?: TokenDetails } {
     const db = getDb();
 
-    const service = db.prepare('SELECT id FROM services WHERE id = ?').get(data.service_id);
+    const service = db.prepare('SELECT id, max_capacity FROM services WHERE id = ?').get(data.service_id) as any;
     if (!service) {
       return { success: false, error: 'Service not found' };
     }
@@ -262,7 +332,7 @@ export class DefaultQueueEngine implements IQueueEngine {
       if (data.student_id) {
         const existingActive = db.prepare(`
           SELECT * FROM tokens
-          WHERE student_id = ? AND service_id = ? AND status IN ('WAITING', 'SERVING', 'HELD')
+          WHERE student_id = ? AND service_id = ? AND status IN ('WAITING', 'SERVING', 'HELD', 'WAITLISTED')
           LIMIT 1
         `).get(data.student_id, data.service_id) as TokenRecord | undefined;
 
@@ -272,6 +342,16 @@ export class DefaultQueueEngine implements IQueueEngine {
         }
       }
 
+      // Check active queue capacity for this service
+      const maxCapacity = service.max_capacity !== null && service.max_capacity !== undefined ? service.max_capacity : (Number(process.env.MAX_QUEUE_CAPACITY) || 10);
+      const activeCountResult = db.prepare(`
+        SELECT COUNT(*) as count FROM tokens
+        WHERE service_id = ? AND status IN ('WAITING', 'SERVING', 'HELD')
+      `).get(data.service_id) as any;
+
+      const activeCount = activeCountResult?.count || 0;
+      const initialStatus: TokenStatus = activeCount >= maxCapacity ? 'WAITLISTED' : 'WAITING';
+
       const id = 'tkn-' + Math.random().toString(36).substr(2, 9);
       const tokenNumber = this.generateTokenNumber(data.service_id);
       const now = new Date().toISOString();
@@ -280,7 +360,7 @@ export class DefaultQueueEngine implements IQueueEngine {
         INSERT INTO tokens (
           id, token_number, student_id, student_name, student_email, service_id,
           priority, status, created_at, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'WAITING', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         tokenNumber,
@@ -289,6 +369,7 @@ export class DefaultQueueEngine implements IQueueEngine {
         data.student_email || null,
         data.service_id,
         data.priority,
+        initialStatus,
         now,
         data.notes || null
       );
@@ -324,6 +405,7 @@ export class DefaultQueueEngine implements IQueueEngine {
     const db = getDb();
     let resultToken: TokenRecord | null = null;
     let errorMessage: string | null = null;
+    let serviceIdToPromote: string | null = null;
 
     const transaction = db.transaction(() => {
       const token = db.prepare('SELECT * FROM tokens WHERE id = ?').get(tokenId) as TokenRecord | undefined;
@@ -332,16 +414,17 @@ export class DefaultQueueEngine implements IQueueEngine {
         return;
       }
 
-      if (token.status !== 'WAITING' && token.status !== 'HELD') {
-        errorMessage = `Invalid transition: Cannot cancel token with status '${token.status}'. Must be 'WAITING' or 'HELD'.`;
+      if (token.status !== 'WAITING' && token.status !== 'HELD' && token.status !== 'WAITLISTED') {
+        errorMessage = `Invalid transition: Cannot cancel token with status '${token.status}'. Must be 'WAITING', 'HELD', or 'WAITLISTED'.`;
         return;
       }
 
+      const wasActive = token.status === 'WAITING' || token.status === 'HELD';
       const now = new Date().toISOString();
       const updateRes = db.prepare(`
         UPDATE tokens
         SET status = 'CANCELLED', completed_at = ?
-        WHERE id = ? AND status IN ('WAITING', 'HELD')
+        WHERE id = ? AND status IN ('WAITING', 'HELD', 'WAITLISTED')
       `).run(now, tokenId);
 
       if (updateRes.changes === 0) {
@@ -350,12 +433,20 @@ export class DefaultQueueEngine implements IQueueEngine {
       }
 
       resultToken = db.prepare('SELECT * FROM tokens WHERE id = ?').get(tokenId) as TokenRecord;
+      if (wasActive) {
+        serviceIdToPromote = token.service_id;
+      }
     }).immediate;
 
     transaction();
 
     if (errorMessage) {
       return { success: false, error: errorMessage };
+    }
+
+    // Auto-evaluate waitlist if active capacity freed up
+    if (serviceIdToPromote) {
+      this.evaluateAndPromoteWaitlist(serviceIdToPromote);
     }
 
     return { success: true, token: resultToken! };
@@ -438,6 +529,7 @@ export class DefaultQueueEngine implements IQueueEngine {
     const db = getDb();
     let resultToken: TokenRecord | null = null;
     let errorMessage: string | null = null;
+    let serviceIdToPromote: string | null = null;
 
     const transaction = db.transaction(() => {
       const token = db.prepare('SELECT * FROM tokens WHERE id = ?').get(tokenId) as TokenRecord | undefined;
@@ -470,11 +562,18 @@ export class DefaultQueueEngine implements IQueueEngine {
       }
 
       resultToken = db.prepare('SELECT * FROM tokens WHERE id = ?').get(tokenId) as TokenRecord;
+      serviceIdToPromote = token.service_id;
     }).immediate;
 
     transaction();
 
     if (errorMessage) return { success: false, error: errorMessage };
+
+    // Auto-promote waitlist when capacity is freed up
+    if (serviceIdToPromote) {
+      this.evaluateAndPromoteWaitlist(serviceIdToPromote);
+    }
+
     return { success: true, token: resultToken! };
   }
 
@@ -583,6 +682,7 @@ export class DefaultQueueEngine implements IQueueEngine {
     const db = getDb();
     let resultToken: TokenRecord | null = null;
     let errorMessage: string | null = null;
+    let serviceIdToPromote: string | null = null;
 
     const transaction = db.transaction(() => {
       const token = db.prepare('SELECT * FROM tokens WHERE id = ?').get(tokenId) as TokenRecord | undefined;
@@ -596,6 +696,7 @@ export class DefaultQueueEngine implements IQueueEngine {
         return;
       }
 
+      const wasActive = token.status === 'SERVING' || token.status === 'HELD' || token.status === 'WAITING';
       const now = new Date().toISOString();
 
       const updateRes = db.prepare(`
@@ -610,11 +711,20 @@ export class DefaultQueueEngine implements IQueueEngine {
       }
 
       resultToken = db.prepare('SELECT * FROM tokens WHERE id = ?').get(tokenId) as TokenRecord;
+      if (wasActive) {
+        serviceIdToPromote = token.service_id;
+      }
     }).immediate;
 
     transaction();
 
     if (errorMessage) return { success: false, error: errorMessage };
+
+    // Auto-promote waitlist when capacity is freed up
+    if (serviceIdToPromote) {
+      this.evaluateAndPromoteWaitlist(serviceIdToPromote);
+    }
+
     return { success: true, token: resultToken! };
   }
 
@@ -680,10 +790,96 @@ export class DefaultQueueEngine implements IQueueEngine {
   }
 
   /**
+   * Evaluate waitlist and promote eligible waitlisted candidates to WAITING status
+   * when active capacity becomes available.
+   * Concurrency-safe, capacity-aware, starvation-preventing atomic execution.
+   */
+  evaluateAndPromoteWaitlist(serviceId: string): { success: boolean; promotedTokens: TokenRecord[]; availableSlots: number; error?: string } {
+    const db = getDb();
+    let promotedTokens: TokenRecord[] = [];
+    let availableSlots = 0;
+    let errorMessage: string | null = null;
+
+    const transaction = db.transaction(() => {
+      const service = db.prepare('SELECT id, max_capacity FROM services WHERE id = ?').get(serviceId) as any;
+      if (!service) {
+        errorMessage = 'Service not found';
+        return;
+      }
+
+      const maxCapacity = service.max_capacity !== null && service.max_capacity !== undefined ? service.max_capacity : (Number(process.env.MAX_QUEUE_CAPACITY) || 10);
+
+      const activeCountResult = db.prepare(`
+        SELECT COUNT(*) as count FROM tokens
+        WHERE service_id = ? AND status IN ('WAITING', 'SERVING', 'HELD')
+      `).get(serviceId) as any;
+
+      const activeCount = activeCountResult?.count || 0;
+      availableSlots = Math.max(0, maxCapacity - activeCount);
+
+      if (availableSlots <= 0) {
+        return;
+      }
+
+      const candidates = getSortedWaitlistTokens(serviceId);
+      if (!candidates || candidates.length === 0) {
+        return;
+      }
+
+      for (const candidate of candidates) {
+        if (promotedTokens.length >= availableSlots) {
+          break;
+        }
+
+        // Check if student already has another active token
+        if (candidate.student_id) {
+          const activeDuplicate = db.prepare(`
+            SELECT id FROM tokens
+            WHERE student_id = ? AND service_id = ? AND status IN ('WAITING', 'SERVING', 'HELD')
+            LIMIT 1
+          `).get(candidate.student_id, serviceId);
+
+          if (activeDuplicate) {
+            // Student already active, skip candidate
+            continue;
+          }
+        }
+
+        // Conditional atomic update
+        const updateRes = db.prepare(`
+          UPDATE tokens
+          SET status = 'WAITING'
+          WHERE id = ? AND status = 'WAITLISTED'
+        `).run(candidate.id);
+
+        if (updateRes.changes > 0) {
+          const promoted = db.prepare('SELECT * FROM tokens WHERE id = ?').get(candidate.id) as TokenRecord;
+          promotedTokens.push(promoted);
+        }
+      }
+    }).immediate;
+
+    transaction();
+
+    if (errorMessage) {
+      return { success: false, promotedTokens: [], availableSlots: 0, error: errorMessage };
+    }
+
+    return { success: true, promotedTokens, availableSlots };
+  }
+
+  /**
    * Get all waiting tokens ordered by priority + starvation algorithm
    */
   getWaitingQueue(serviceId: string): TokenRecord[] {
     return getSortedWaitingTokens(serviceId);
+  }
+
+  /**
+   * Get all waitlisted tokens ordered by fairness policy
+   */
+  getWaitlistQueue(serviceId: string): TokenRecord[] {
+    return getSortedWaitlistTokens(serviceId);
   }
 
   /**

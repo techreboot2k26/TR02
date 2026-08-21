@@ -10,24 +10,17 @@ from app.config import settings
 from app.services import queue_service, student_service
 
 settings.mock_auth = True
-settings.db_path = "test_queuecraft_concurrency.db"
+settings.db_path = "test_queuecraft.db"
 
 client = TestClient(app)
 
 @pytest.fixture(scope="module", autouse=True)
 def setup_concurrency_db():
-    orig_db = settings.db_path
-    settings.db_path = "test_queuecraft_concurrency.db"
+    settings.db_path = "test_queuecraft.db"
     from app.database import initialize_schema, seed_database
     initialize_schema()
     seed_database()
     yield
-    if os.path.exists("test_queuecraft_concurrency.db"):
-        try:
-            os.remove("test_queuecraft_concurrency.db")
-        except PermissionError:
-            pass
-    settings.db_path = orig_db
 
 def get_test_conn():
     conn = sqlite3.connect(settings.db_path, timeout=5.0, isolation_level=None)

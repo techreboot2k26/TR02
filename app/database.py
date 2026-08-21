@@ -62,6 +62,7 @@ def initialize_schema() -> None:
           name TEXT NOT NULL,
           code TEXT UNIQUE NOT NULL,
           description TEXT,
+          max_capacity INTEGER DEFAULT 10,
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         """)
@@ -91,7 +92,7 @@ def initialize_schema() -> None:
           service_id TEXT NOT NULL,
           counter_id TEXT,
           priority TEXT NOT NULL DEFAULT 'NORMAL' CHECK(priority IN ('NORMAL', 'HIGH', 'PRIORITY', 'URGENT')),
-          status TEXT NOT NULL DEFAULT 'WAITING' CHECK(status IN ('WAITING', 'SERVING', 'HELD', 'COMPLETED', 'SKIPPED', 'CANCELLED')),
+          status TEXT NOT NULL DEFAULT 'WAITING' CHECK(status IN ('WAITING', 'SERVING', 'HELD', 'COMPLETED', 'SKIPPED', 'CANCELLED', 'WAITLISTED', 'PROMOTED', 'EXPIRED')),
           created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
           started_at DATETIME,
           completed_at DATETIME,
@@ -108,29 +109,73 @@ def initialize_schema() -> None:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tokens_service_status ON tokens(service_id, status);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tokens_counter_status ON tokens(counter_id, status);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tokens_created_priority ON tokens(priority, created_at);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tokens_waitlist ON tokens(service_id, status, created_at);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_counters_assigned_staff ON counters(assigned_staff_id);")
 
         # DATABASE-LEVEL CONCURRENCY INVARIANT ENFORCEMENT
         # 1. At most ONE token can be in SERVING status for any given counter simultaneously
         cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_counter_serving ON tokens(counter_id) WHERE status = 'SERVING';")
         
+        try:
+            cursor.execute("ALTER TABLE services ADD COLUMN max_capacity INTEGER DEFAULT 10;")
+        except Exception:
+            pass
+
+        try:
+            cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='tokens';")
+            row = cursor.fetchone()
+            if row and "WAITLISTED" not in row[0]:
+                cursor.execute("ALTER TABLE tokens RENAME TO tokens_old;")
+                cursor.execute("""
+                CREATE TABLE tokens (
+                  id TEXT PRIMARY KEY,
+                  token_number TEXT NOT NULL,
+                  student_id TEXT,
+                  student_name TEXT NOT NULL,
+                  student_email TEXT,
+                  service_id TEXT NOT NULL,
+                  counter_id TEXT,
+                  priority TEXT NOT NULL DEFAULT 'NORMAL' CHECK(priority IN ('NORMAL', 'HIGH', 'PRIORITY', 'URGENT')),
+                  status TEXT NOT NULL DEFAULT 'WAITING' CHECK(status IN ('WAITING', 'SERVING', 'HELD', 'COMPLETED', 'SKIPPED', 'CANCELLED', 'WAITLISTED', 'PROMOTED', 'EXPIRED')),
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  started_at DATETIME,
+                  completed_at DATETIME,
+                  skipped_at DATETIME,
+                  held_at DATETIME,
+                  notes TEXT,
+                  FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+                  FOREIGN KEY (counter_id) REFERENCES counters(id) ON DELETE SET NULL,
+                  FOREIGN KEY (student_id) REFERENCES users(id) ON DELETE SET NULL
+                );
+                """)
+                cursor.execute("INSERT INTO tokens SELECT * FROM tokens_old;")
+                cursor.execute("DROP TABLE tokens_old;")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_tokens_service_status ON tokens(service_id, status);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_tokens_counter_status ON tokens(counter_id, status);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_tokens_created_priority ON tokens(priority, created_at);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_tokens_waitlist ON tokens(service_id, status, created_at);")
+                cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_counter_serving ON tokens(counter_id) WHERE status = 'SERVING';")
+        except Exception:
+            pass
+
         conn.commit()
     finally:
         conn.close()
 
-def seed_database() -> None:
+def seed_database(force: bool = False) -> None:
     """
-    Populates SQLite database with initial seeding information if it is empty.
+    Populates SQLite database with initial seeding information if it is empty or force=True.
     """
     conn = sqlite3.connect(settings.db_path)
     try:
         cursor = conn.cursor()
         
         # Check if database is already seeded
-        cursor.execute("SELECT COUNT(*) as count FROM users;")
-        user_count = cursor.fetchone()[0]
-        if user_count > 0:
-            return
+        if not force:
+            cursor.execute("SELECT COUNT(*) as count FROM users;")
+            user_count = cursor.fetchone()[0]
+            if user_count > 0:
+                return
 
         print("[Database] Seeding database with fresh mock data...")
         

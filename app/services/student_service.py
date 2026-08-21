@@ -28,7 +28,7 @@ def book_token(
         db.execute("BEGIN IMMEDIATE;")
 
         # 1. Verify service exists
-        cursor.execute("SELECT name, code FROM services WHERE id = ?;", (service_id,))
+        cursor.execute("SELECT name, code, max_capacity FROM services WHERE id = ?;", (service_id,))
         service = cursor.fetchone()
         if not service:
             raise HTTPException(
@@ -51,10 +51,10 @@ def book_token(
                 detail="Counter is currently not accepting new tokens"
             )
 
-        # 3. Check for any existing active token (global check matching Express Reference)
+        # 3. Check for any existing active or waitlisted token
         cursor.execute("""
             SELECT id FROM tokens 
-            WHERE student_id = ? AND status IN ('WAITING', 'SERVING', 'HELD');
+            WHERE student_id = ? AND status IN ('WAITING', 'SERVING', 'HELD', 'WAITLISTED');
         """, (user_id,))
         active_token = cursor.fetchone()
         if active_token:
@@ -62,6 +62,17 @@ def book_token(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="You already have an active token. Complete or cancel it first."
             )
+
+        # Calculate active queue capacity (WAITING, SERVING, HELD)
+        import os
+        max_cap = service["max_capacity"] if service["max_capacity"] is not None else int(os.environ.get("MAX_QUEUE_CAPACITY", "10"))
+        cursor.execute("""
+            SELECT COUNT(*) as count 
+            FROM tokens 
+            WHERE service_id = ? AND status IN ('WAITING', 'SERVING', 'HELD');
+        """, (service_id,))
+        active_count = cursor.fetchone()["count"]
+        initial_status = 'WAITLISTED' if active_count >= max_cap else 'WAITING'
 
         # 4. Generate unique sequential token number (e.g. LP-042)
         cursor.execute("""
@@ -79,8 +90,8 @@ def book_token(
         created_at_val = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')
         cursor.execute("""
             INSERT INTO tokens (id, token_number, student_id, student_name, student_email, service_id, counter_id, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'WAITING', ?);
-        """, (token_id, token_number, user_id, user_name, user_email, service_id, counter_id, created_at_val))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (token_id, token_number, user_id, user_name, user_email, service_id, counter_id, initial_status, created_at_val))
 
         db.execute("COMMIT;")
 
@@ -94,7 +105,7 @@ def book_token(
         """, (token_id,))
         new_token = dict(cursor.fetchone())
         
-        # Default wait stats for new waiting token
+        # Default wait stats for new token
         new_token["people_ahead"] = 0
         new_token["estimated_wait_time"] = 0
         
@@ -118,7 +129,7 @@ def book_token(
 
 def get_active_token(db: sqlite3.Connection, user_id: str) -> dict | None:
     """
-    Retrieves the current active token (WAITING, SERVING, HELD) for a student,
+    Retrieves the current active token (WAITING, SERVING, HELD, WAITLISTED) for a student,
     including real-time queue position and wait estimates.
     """
     cursor = db.cursor()
@@ -129,7 +140,7 @@ def get_active_token(db: sqlite3.Connection, user_id: str) -> dict | None:
             FROM tokens t
             JOIN services s ON t.service_id = s.id
             JOIN counters c ON t.counter_id = c.id
-            WHERE t.student_id = ? AND t.status IN ('WAITING', 'SERVING', 'HELD')
+            WHERE t.student_id = ? AND t.status IN ('WAITING', 'SERVING', 'HELD', 'WAITLISTED')
             ORDER BY t.created_at DESC
             LIMIT 1;
         """, (user_id,))
@@ -180,10 +191,11 @@ def get_token_history(db: sqlite3.Connection, user_id: str) -> list:
 
 def cancel_token(db: sqlite3.Connection, user_id: str, token_id: str) -> dict:
     """
-    Cancels a student's active waiting or held token.
+    Cancels a student's active waiting, held, or waitlisted token.
     Enforces ownership and state transitions inside an immediate transaction.
     """
     cursor = db.cursor()
+    service_id_to_promote = None
     try:
         db.execute("BEGIN IMMEDIATE;")
         # Fetch token to verify existence and check details
@@ -208,17 +220,19 @@ def cancel_token(db: sqlite3.Connection, user_id: str, token_id: str) -> dict:
             )
             
         # Verify state transition
-        if token["status"] not in ("WAITING", "HELD"):
+        if token["status"] not in ("WAITING", "HELD", "WAITLISTED"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Cannot cancel token with status: {token['status']}"
             )
             
+        was_active = token["status"] in ("WAITING", "HELD")
+        
         # Update token state to CANCELLED
         cursor.execute("""
             UPDATE tokens 
             SET status = 'CANCELLED', completed_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND status IN ('WAITING', 'HELD');
+            WHERE id = ? AND status IN ('WAITING', 'HELD', 'WAITLISTED');
         """, (token_id,))
         
         if cursor.rowcount == 0:
@@ -227,7 +241,14 @@ def cancel_token(db: sqlite3.Connection, user_id: str, token_id: str) -> dict:
                 detail="Failed to cancel token: State changed concurrently"
             )
             
+        if was_active:
+            service_id_to_promote = token["service_id"]
+            
         db.execute("COMMIT;")
+        
+        if service_id_to_promote:
+            from app.services import queue_service
+            queue_service.evaluate_and_promote_waitlist(db, service_id_to_promote)
         
         return {
             "success": True,
