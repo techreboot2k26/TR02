@@ -15,16 +15,17 @@ def hash_password(password: str) -> str:
 def get_db() -> Generator[sqlite3.Connection, None, None]:
     """
     Generator dependency to yield a SQLite database connection.
-    Enforces foreign key constraints and WAL journal mode.
+    Enforces foreign key constraints, WAL journal mode, and busy timeout.
     """
-    conn = sqlite3.connect(settings.db_path, check_same_thread=False)
+    conn = sqlite3.connect(settings.db_path, check_same_thread=False, timeout=5.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     
     # Enable foreign keys
     conn.execute("PRAGMA foreign_keys = ON;")
     
-    # Enable WAL mode for concurrent operations
+    # Enable WAL mode and busy timeout for concurrent operations
     conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
     
     try:
         yield conn
@@ -35,9 +36,12 @@ def initialize_schema() -> None:
     """
     Creates SQLite database tables if they do not exist.
     """
-    conn = sqlite3.connect(settings.db_path)
+    conn = sqlite3.connect(settings.db_path, timeout=5.0, isolation_level=None)
     try:
         cursor = conn.cursor()
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA busy_timeout = 5000;")
         
         # 1. USERS TABLE
         cursor.execute("""
@@ -100,11 +104,15 @@ def initialize_schema() -> None:
         );
         """)
         
-        # INDEXES FOR MAX PERFORMANCE
+        # INDEXES FOR MAX PERFORMANCE & CONCURRENCY CONSTRAINTS
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tokens_service_status ON tokens(service_id, status);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tokens_counter_status ON tokens(counter_id, status);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tokens_created_priority ON tokens(priority, created_at);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_counters_assigned_staff ON counters(assigned_staff_id);")
+
+        # DATABASE-LEVEL CONCURRENCY INVARIANT ENFORCEMENT
+        # 1. At most ONE token can be in SERVING status for any given counter simultaneously
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_counter_serving ON tokens(counter_id) WHERE status = 'SERVING';")
         
         conn.commit()
     finally:

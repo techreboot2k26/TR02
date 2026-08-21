@@ -37,9 +37,10 @@ export function getDb(): any {
         fs.mkdirSync(dbDir, { recursive: true });
       }
       const Database = require('better-sqlite3');
-      dbInstance = new Database(dbPath);
-      // Enable Foreign Keys & Write-Ahead Logging for concurrency safety
+      dbInstance = new Database(dbPath, { timeout: 5000 });
+      // Enable Foreign Keys, Write-Ahead Logging & busy timeout for concurrency safety
       dbInstance.pragma('foreign_keys = ON');
+      dbInstance.pragma('busy_timeout = 5000');
       if (!isVercel) {
         dbInstance.pragma('journal_mode = WAL');
       }

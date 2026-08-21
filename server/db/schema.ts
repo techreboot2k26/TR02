@@ -57,10 +57,14 @@ export function initializeSchema(): void {
       FOREIGN KEY (student_id) REFERENCES users(id) ON DELETE SET NULL
     );
 
-    -- INDEXES FOR QUEUE PERFORMANCE
+    -- INDEXES FOR QUEUE PERFORMANCE & CONCURRENCY CONSTRAINTS
     CREATE INDEX IF NOT EXISTS idx_tokens_service_status ON tokens(service_id, status);
     CREATE INDEX IF NOT EXISTS idx_tokens_counter_status ON tokens(counter_id, status);
     CREATE INDEX IF NOT EXISTS idx_tokens_created_priority ON tokens(priority, created_at);
     CREATE INDEX IF NOT EXISTS idx_counters_assigned_staff ON counters(assigned_staff_id);
+
+    -- DATABASE-LEVEL CONCURRENCY INVARIANT ENFORCEMENT
+    -- 1. At most ONE token can be in SERVING status for any given counter simultaneously
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_counter_serving ON tokens(counter_id) WHERE status = 'SERVING';
   `);
 }
