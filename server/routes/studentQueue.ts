@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { AuthRequest, authenticateToken, requireRole } from '../middleware/auth.js';
 import { getDb } from '../db/database.js';
 import { socketService } from '../services/socketService.js';
+import { queueEngine } from '../services/queueEngine.js';
 import crypto from 'crypto';
 
 const router = Router();
@@ -69,10 +70,10 @@ router.post('/tokens/book', (req: AuthRequest, res: Response) => {
     let statusCode = 400;
 
     const transaction = db.transaction(() => {
-      // Check if the student already has an active token
+      // Check if the student already has an active or waitlisted token
       const activeToken = db.prepare(`
         SELECT id FROM tokens 
-        WHERE student_id = ? AND status IN ('WAITING', 'SERVING', 'HELD')
+        WHERE student_id = ? AND status IN ('WAITING', 'SERVING', 'HELD', 'WAITLISTED')
       `).get(user.id);
 
       if (activeToken) {
@@ -81,8 +82,8 @@ router.post('/tokens/book', (req: AuthRequest, res: Response) => {
         return;
       }
 
-      // Get service code
-      const service = db.prepare('SELECT code FROM services WHERE id = ?').get(service_id) as any;
+      // Get service code & capacity
+      const service = db.prepare('SELECT id, code, max_capacity FROM services WHERE id = ?').get(service_id) as any;
       if (!service) {
         errorMessage = 'Service not found';
         statusCode = 404;
@@ -103,6 +104,17 @@ router.post('/tokens/book', (req: AuthRequest, res: Response) => {
         return;
       }
 
+      // Calculate active queue capacity (WAITING, SERVING, HELD)
+      const maxCapacity = service.max_capacity !== null && service.max_capacity !== undefined ? service.max_capacity : (Number(process.env.MAX_QUEUE_CAPACITY) || 10);
+      const activeCountResult = db.prepare(`
+        SELECT COUNT(*) as count 
+        FROM tokens 
+        WHERE service_id = ? AND status IN ('WAITING', 'SERVING', 'HELD')
+      `).get(service_id) as any;
+      const activeCount = activeCountResult?.count || 0;
+
+      const initialStatus = activeCount >= maxCapacity ? 'WAITLISTED' : 'WAITING';
+
       // Generate Token Number (e.g., LP-042)
       const sequenceQuery = db.prepare(`
         SELECT COUNT(*) as count 
@@ -117,8 +129,8 @@ router.post('/tokens/book', (req: AuthRequest, res: Response) => {
       // Insert new token
       db.prepare(`
         INSERT INTO tokens (id, token_number, student_id, student_name, student_email, service_id, counter_id, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'WAITING')
-      `).run(tokenId, tokenNumber, user.id, user.name, user.email, service_id, counter_id);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(tokenId, tokenNumber, user.id, user.name, user.email, service_id, counter_id, initialStatus);
 
       // Fetch the inserted token details
       createdToken = db.prepare(`
@@ -149,7 +161,7 @@ router.post('/tokens/book', (req: AuthRequest, res: Response) => {
 
 /**
  * 3. GET /api/student/tokens/active
- * Get the student's current active token (WAITING, SERVING, HELD)
+ * Get the student's current active token (WAITING, SERVING, HELD, WAITLISTED)
  */
 router.get('/tokens/active', (req: AuthRequest, res: Response) => {
   const user = req.user!;
@@ -160,8 +172,8 @@ router.get('/tokens/active', (req: AuthRequest, res: Response) => {
       SELECT t.*, s.name as service_name, c.name as counter_name
       FROM tokens t
       JOIN services s ON t.service_id = s.id
-      JOIN counters c ON t.counter_id = c.id
-      WHERE t.student_id = ? AND t.status IN ('WAITING', 'SERVING', 'HELD')
+      LEFT JOIN counters c ON t.counter_id = c.id
+      WHERE t.student_id = ? AND t.status IN ('WAITING', 'SERVING', 'HELD', 'WAITLISTED')
       ORDER BY t.created_at DESC
       LIMIT 1
     `).get(user.id) as any;
@@ -171,21 +183,15 @@ router.get('/tokens/active', (req: AuthRequest, res: Response) => {
       return;
     }
 
-    let peopleAhead = 0;
-    if (token.status === 'WAITING' || token.status === 'HELD') {
-       const aheadQuery = db.prepare(`
-         SELECT COUNT(*) as count 
-         FROM tokens 
-         WHERE counter_id = ? AND status IN ('WAITING', 'HELD') AND created_at < ?
-       `).get(token.counter_id, token.created_at) as any;
-       peopleAhead = aheadQuery.count;
-    }
+    const posDetails = queueEngine.getTokenPositionDetails(token.id);
+    const peopleAhead = posDetails ? posDetails.peopleAhead : 0;
+    const estimatedWait = posDetails ? posDetails.estimatedWaitMinutes : 0;
 
     res.json({ 
       token: {
         ...token,
         people_ahead: peopleAhead,
-        estimated_wait_time: peopleAhead * 5
+        estimated_wait_time: estimatedWait
       } 
     });
   } catch (err) {
@@ -221,7 +227,7 @@ router.get('/tokens/history', (req: AuthRequest, res: Response) => {
 
 /**
  * 5. PATCH /api/student/tokens/:tokenId/cancel
- * Allow a student to cancel their waiting token
+ * Allow a student to cancel their waiting or waitlisted token
  */
 router.patch('/tokens/:tokenId/cancel', (req: AuthRequest, res: Response) => {
   const { tokenId } = req.params;
@@ -232,6 +238,7 @@ router.patch('/tokens/:tokenId/cancel', (req: AuthRequest, res: Response) => {
     let errorMessage: string | null = null;
     let statusCode = 400;
     let cancelledToken: any = null;
+    let wasActive = false;
 
     const transaction = db.transaction(() => {
       const token = db.prepare(`
@@ -244,16 +251,18 @@ router.patch('/tokens/:tokenId/cancel', (req: AuthRequest, res: Response) => {
         return;
       }
 
-      if (token.status !== 'WAITING' && token.status !== 'HELD') {
+      if (token.status !== 'WAITING' && token.status !== 'HELD' && token.status !== 'WAITLISTED') {
         errorMessage = `Cannot cancel token with status: ${token.status}`;
         statusCode = 400;
         return;
       }
 
+      wasActive = token.status === 'WAITING' || token.status === 'HELD';
+
       const updateRes = db.prepare(`
         UPDATE tokens 
         SET status = 'CANCELLED', completed_at = CURRENT_TIMESTAMP
-        WHERE id = ? AND status IN ('WAITING', 'HELD')
+        WHERE id = ? AND status IN ('WAITING', 'HELD', 'WAITLISTED')
       `).run(tokenId);
 
       if (updateRes.changes === 0) {
@@ -270,6 +279,11 @@ router.patch('/tokens/:tokenId/cancel', (req: AuthRequest, res: Response) => {
     if (errorMessage) {
       res.status(statusCode).json({ error: errorMessage });
       return;
+    }
+
+    // Auto-promote waitlist if active capacity freed up
+    if (wasActive && cancelledToken?.service_id) {
+      queueEngine.evaluateAndPromoteWaitlist(cancelledToken.service_id);
     }
 
     if (cancelledToken?.counter_id && cancelledToken?.service_id) {

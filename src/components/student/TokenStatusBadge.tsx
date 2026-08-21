@@ -1,7 +1,7 @@
 import React from 'react';
 
 interface TokenStatusBadgeProps {
-  status: 'WAITING' | 'SERVING' | 'COMPLETED' | 'CANCELLED' | 'SKIPPED' | 'HELD';
+  status: 'WAITING' | 'SERVING' | 'COMPLETED' | 'CANCELLED' | 'SKIPPED' | 'HELD' | 'WAITLISTED' | 'PROMOTED' | 'EXPIRED';
   size?: 'sm' | 'md' | 'lg';
 }
 
@@ -10,6 +10,18 @@ export const TokenStatusBadge: React.FC<TokenStatusBadgeProps> = ({ status, size
   let color = '';
 
   switch (status) {
+    case 'WAITLISTED':
+      bgColor = 'rgba(139, 92, 246, 0.2)'; // Purple
+      color = '#a78bfa';
+      break;
+    case 'PROMOTED':
+      bgColor = 'rgba(6, 182, 212, 0.2)'; // Cyan
+      color = '#22d3ee';
+      break;
+    case 'EXPIRED':
+      bgColor = 'rgba(156, 163, 175, 0.2)'; // Slate
+      color = '#9ca3af';
+      break;
     case 'WAITING':
       bgColor = 'rgba(59, 130, 246, 0.2)'; // Blue
       color = '#60a5fa';
