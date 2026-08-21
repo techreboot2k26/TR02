@@ -41,7 +41,7 @@ def get_dashboard_data(db: sqlite3.Connection, counter: dict) -> dict:
         SELECT t.*, s.name as service_name, c.name as counter_name
         FROM tokens t
         JOIN services s ON t.service_id = s.id
-        JOIN counters c ON t.counter_id = c.id
+        LEFT JOIN counters c ON t.counter_id = c.id
         WHERE t.counter_id = ? AND t.status = 'SERVING'
         LIMIT 1;
     """, (counter["id"],))
@@ -58,16 +58,16 @@ def get_dashboard_data(db: sqlite3.Connection, counter: dict) -> dict:
             SELECT t.*, s.name as service_name, c.name as counter_name
             FROM tokens t
             JOIN services s ON t.service_id = s.id
-            JOIN counters c ON t.counter_id = c.id
+            LEFT JOIN counters c ON t.counter_id = c.id
             WHERE t.id = ?;
         """, (t["id"],))
-        token_detail = dict(cursor.fetchone())
-        
-        pos_details = queue_service.get_token_position_details(db, t["id"])
-        if pos_details:
-            token_detail.update(pos_details)
-            
-        waiting_queue_details.append(token_detail)
+        row = cursor.fetchone()
+        if row:
+            token_detail = dict(row)
+            pos_details = queue_service.get_token_position_details(db, t["id"])
+            if pos_details:
+                token_detail.update(pos_details)
+            waiting_queue_details.append(token_detail)
 
     # 6. Operational Stats
     # held count
@@ -83,13 +83,12 @@ def get_dashboard_data(db: sqlite3.Connection, counter: dict) -> dict:
 
     # average service time calculation
     cursor.execute("""
-        SELECT AVG((julianday(completed_at) - julianday(started_at)) * 24 * 60) as avg_mins
+        SELECT AVG((strftime('%s', completed_at) - strftime('%s', started_at)) / 60.0) as avg_mins
         FROM tokens
         WHERE counter_id = ? AND status = 'COMPLETED' AND started_at IS NOT NULL AND completed_at IS NOT NULL;
     """, (counter["id"],))
     avg_row = cursor.fetchone()
-    avg_mins = avg_row["avg_mins"] if avg_row and avg_row["avg_mins"] is not None else 4.5
-    avg_service_time = round(avg_mins, 1)
+    avg_mins = round(avg_row["avg_mins"], 1) if avg_row and avg_row["avg_mins"] is not None else 4.5
 
     return {
         "staff": {
@@ -113,7 +112,7 @@ def get_dashboard_data(db: sqlite3.Connection, counter: dict) -> dict:
             "waiting_count": len(waiting_queue_details),
             "held_count": held_count,
             "completed_today_count": completed_today_count,
-            "avg_service_time_minutes": avg_service_time
+            "avg_service_time_minutes": avg_mins
         }
     }
 
@@ -153,16 +152,16 @@ def get_counter_waiting_queue(
             SELECT t.*, s.name as service_name, c.name as counter_name
             FROM tokens t
             JOIN services s ON t.service_id = s.id
-            JOIN counters c ON t.counter_id = c.id
+            LEFT JOIN counters c ON t.counter_id = c.id
             WHERE t.id = ?;
         """, (t["id"],))
-        token_detail = dict(cursor.fetchone())
-        
-        pos_details = queue_service.get_token_position_details(db, t["id"])
-        if pos_details:
-            token_detail.update(pos_details)
-            
-        detailed_queue.append(token_detail)
+        row = cursor.fetchone()
+        if row:
+            token_detail = dict(row)
+            pos_details = queue_service.get_token_position_details(db, t["id"])
+            if pos_details:
+                token_detail.update(pos_details)
+            detailed_queue.append(token_detail)
         
     return detailed_queue
 

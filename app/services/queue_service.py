@@ -93,24 +93,34 @@ def call_next_token(db: sqlite3.Connection, counter_id: str, service_id: str) ->
                 detail=f"Counter already has active serving token {active_serving['token_number']}. Complete, hold, or skip it first."
             )
             
-        # 3. Pull next eligible token
+        # 3. Pull next eligible token candidates
         waiting = get_waiting_queue(db, service_id)
         if not waiting:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Waiting queue is currently empty for this service."
             )
-        next_token = waiting[0]
         
-        # 4. Mutate to SERVING
+        # 4. Atomically claim the top eligible waiting token
         now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')
-        cursor.execute("""
-            UPDATE tokens
-            SET status = 'SERVING', counter_id = ?, started_at = ?
-            WHERE id = ? AND status = 'WAITING';
-        """, (counter_id, now, next_token["id"]))
+        claimed_token_id = None
+        for candidate in waiting:
+            cursor.execute("""
+                UPDATE tokens
+                SET status = 'SERVING', counter_id = ?, started_at = ?
+                WHERE id = ? AND status = 'WAITING';
+            """, (counter_id, now, candidate["id"]))
+            if cursor.rowcount > 0:
+                claimed_token_id = candidate["id"]
+                break
+
+        if not claimed_token_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Waiting queue is currently empty for this service."
+            )
         
-        db.commit()
+        db.execute("COMMIT;")
         
         # Get updated token
         cursor.execute("""
@@ -119,14 +129,20 @@ def call_next_token(db: sqlite3.Connection, counter_id: str, service_id: str) ->
             JOIN services s ON t.service_id = s.id
             JOIN counters c ON t.counter_id = c.id
             WHERE t.id = ?;
-        """, (next_token["id"],))
+        """, (claimed_token_id,))
         return dict(cursor.fetchone())
         
     except HTTPException:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise
     except sqlite3.Error as e:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database transaction error: {str(e)}"
@@ -161,9 +177,16 @@ def complete_token(db: sqlite3.Connection, token_id: str, counter_id: str) -> di
         cursor.execute("""
             UPDATE tokens
             SET status = 'COMPLETED', completed_at = ?
-            WHERE id = ? AND status = 'SERVING';
-        """, (now, token_id))
-        db.commit()
+            WHERE id = ? AND status = 'SERVING' AND counter_id = ?;
+        """, (now, token_id, counter_id))
+        
+        if cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="State transition failed: Token is no longer in SERVING status for this counter."
+            )
+            
+        db.execute("COMMIT;")
         
         cursor.execute("""
             SELECT t.*, s.name as service_name, c.name as counter_name
@@ -175,10 +198,16 @@ def complete_token(db: sqlite3.Connection, token_id: str, counter_id: str) -> di
         return dict(cursor.fetchone())
         
     except HTTPException:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise
     except sqlite3.Error as e:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database transaction error: {str(e)}"
@@ -213,9 +242,16 @@ def hold_token(db: sqlite3.Connection, token_id: str, counter_id: str) -> dict:
         cursor.execute("""
             UPDATE tokens
             SET status = 'HELD', held_at = ?
-            WHERE id = ? AND status = 'SERVING';
-        """, (now, token_id))
-        db.commit()
+            WHERE id = ? AND status = 'SERVING' AND counter_id = ?;
+        """, (now, token_id, counter_id))
+        
+        if cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="State transition failed: Token is no longer in SERVING status for this counter."
+            )
+            
+        db.execute("COMMIT;")
         
         cursor.execute("""
             SELECT t.*, s.name as service_name, c.name as counter_name
@@ -227,10 +263,16 @@ def hold_token(db: sqlite3.Connection, token_id: str, counter_id: str) -> dict:
         return dict(cursor.fetchone())
         
     except HTTPException:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise
     except sqlite3.Error as e:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database transaction error: {str(e)}"
@@ -270,7 +312,14 @@ def resume_token(db: sqlite3.Connection, token_id: str, counter_id: str) -> dict
             SET status = 'SERVING', counter_id = ?, started_at = ?
             WHERE id = ? AND status = 'HELD';
         """, (counter_id, now, token_id))
-        db.commit()
+        
+        if cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="State transition failed: Token is no longer in HELD status."
+            )
+            
+        db.execute("COMMIT;")
         
         cursor.execute("""
             SELECT t.*, s.name as service_name, c.name as counter_name
@@ -282,10 +331,16 @@ def resume_token(db: sqlite3.Connection, token_id: str, counter_id: str) -> dict
         return dict(cursor.fetchone())
         
     except HTTPException:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise
     except sqlite3.Error as e:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database transaction error: {str(e)}"
@@ -314,9 +369,16 @@ def skip_token(db: sqlite3.Connection, token_id: str, counter_id: str) -> dict:
         cursor.execute("""
             UPDATE tokens
             SET status = 'SKIPPED', skipped_at = ?
-            WHERE id = ?;
+            WHERE id = ? AND status IN ('WAITING', 'SERVING', 'HELD');
         """, (now, token_id))
-        db.commit()
+        
+        if cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid state transition: Cannot skip token with status '{token['status']}'."
+            )
+            
+        db.execute("COMMIT;")
         
         cursor.execute("""
             SELECT t.*, s.name as service_name, c.name as counter_name
@@ -328,10 +390,16 @@ def skip_token(db: sqlite3.Connection, token_id: str, counter_id: str) -> dict:
         return dict(cursor.fetchone())
         
     except HTTPException:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise
     except sqlite3.Error as e:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database transaction error: {str(e)}"

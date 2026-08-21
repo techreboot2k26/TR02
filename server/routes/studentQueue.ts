@@ -64,70 +64,86 @@ router.post('/tokens/book', (req: AuthRequest, res: Response) => {
 
   try {
     const db = getDb();
+    let createdToken: any = null;
+    let errorMessage: string | null = null;
+    let statusCode = 400;
 
-    // Check if the student already has an active token
-    const activeToken = db.prepare(`
-      SELECT id FROM tokens 
-      WHERE student_id = ? AND status IN ('WAITING', 'SERVING', 'HELD')
-    `).get(user.id);
+    const transaction = db.transaction(() => {
+      // Check if the student already has an active token
+      const activeToken = db.prepare(`
+        SELECT id FROM tokens 
+        WHERE student_id = ? AND status IN ('WAITING', 'SERVING', 'HELD')
+      `).get(user.id);
 
-    if (activeToken) {
-      res.status(400).json({ error: 'You already have an active token. Complete or cancel it first.' });
+      if (activeToken) {
+        errorMessage = 'You already have an active token. Complete or cancel it first.';
+        statusCode = 400;
+        return;
+      }
+
+      // Get service code
+      const service = db.prepare('SELECT code FROM services WHERE id = ?').get(service_id) as any;
+      if (!service) {
+        errorMessage = 'Service not found';
+        statusCode = 404;
+        return;
+      }
+
+      // Get counter
+      const counter = db.prepare('SELECT id, status FROM counters WHERE id = ?').get(counter_id) as any;
+      if (!counter) {
+        errorMessage = 'Counter not found';
+        statusCode = 404;
+        return;
+      }
+      
+      if (counter.status === 'CLOSED' || counter.status === 'MAINTENANCE') {
+        errorMessage = 'Counter is currently not accepting new tokens';
+        statusCode = 400;
+        return;
+      }
+
+      // Generate Token Number (e.g., LP-042)
+      const sequenceQuery = db.prepare(`
+        SELECT COUNT(*) as count 
+        FROM tokens 
+        WHERE service_id = ? AND date(created_at) = date('now')
+      `).get(service_id) as any;
+      
+      const seqNum = (sequenceQuery.count + 1).toString().padStart(3, '0');
+      const tokenNumber = `${service.code}-${seqNum}`;
+      const tokenId = crypto.randomUUID();
+
+      // Insert new token
+      db.prepare(`
+        INSERT INTO tokens (id, token_number, student_id, student_name, student_email, service_id, counter_id, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'WAITING')
+      `).run(tokenId, tokenNumber, user.id, user.name, user.email, service_id, counter_id);
+
+      // Fetch the inserted token details
+      createdToken = db.prepare(`
+        SELECT t.*, s.name as service_name, c.name as counter_name
+        FROM tokens t
+        JOIN services s ON t.service_id = s.id
+        JOIN counters c ON t.counter_id = c.id
+        WHERE t.id = ?
+      `).get(tokenId);
+    }).immediate;
+
+    transaction();
+
+    if (errorMessage) {
+      res.status(statusCode).json({ error: errorMessage });
       return;
     }
 
-    // Get service code
-    const service = db.prepare('SELECT code FROM services WHERE id = ?').get(service_id) as any;
-    if (!service) {
-      res.status(404).json({ error: 'Service not found' });
-      return;
-    }
-
-    // Get counter
-    const counter = db.prepare('SELECT id, status FROM counters WHERE id = ?').get(counter_id) as any;
-    if (!counter) {
-      res.status(404).json({ error: 'Counter not found' });
-      return;
-    }
-    
-    if (counter.status === 'CLOSED' || counter.status === 'MAINTENANCE') {
-       res.status(400).json({ error: 'Counter is currently not accepting new tokens' });
-       return;
-    }
-
-    // Generate Token Number (e.g., LP-042)
-    const sequenceQuery = db.prepare(`
-      SELECT COUNT(*) as count 
-      FROM tokens 
-      WHERE service_id = ? AND date(created_at) = date('now')
-    `).get(service_id) as any;
-    
-    const seqNum = (sequenceQuery.count + 1).toString().padStart(3, '0');
-    const tokenNumber = `${service.code}-${seqNum}`;
-    const tokenId = crypto.randomUUID();
-
-    // Insert new token
-    db.prepare(`
-      INSERT INTO tokens (id, token_number, student_id, student_name, student_email, service_id, counter_id, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'WAITING')
-    `).run(tokenId, tokenNumber, user.id, user.name, user.email, service_id, counter_id);
-
-    // Notify staff and other students
+    // Notify staff and other students ONLY AFTER commit
     socketService.emitQueueUpdated(service_id, { counterId: counter_id });
 
-    // Fetch the inserted token details
-    const token = db.prepare(`
-      SELECT t.*, s.name as service_name, c.name as counter_name
-      FROM tokens t
-      JOIN services s ON t.service_id = s.id
-      JOIN counters c ON t.counter_id = c.id
-      WHERE t.id = ?
-    `).get(tokenId);
-
-    res.json({ token });
-  } catch (err) {
+    res.json({ token: createdToken });
+  } catch (err: any) {
     console.error('Error booking token:', err);
-    res.status(500).json({ error: 'Failed to book token' });
+    res.status(500).json({ error: err.message || 'Failed to book token' });
   }
 });
 
@@ -213,35 +229,57 @@ router.patch('/tokens/:tokenId/cancel', (req: AuthRequest, res: Response) => {
 
   try {
     const db = getDb();
-    
-    const token = db.prepare(`
-      SELECT id, status, counter_id, service_id FROM tokens WHERE id = ? AND student_id = ?
-    `).get(tokenId, user.id) as any;
+    let errorMessage: string | null = null;
+    let statusCode = 400;
+    let cancelledToken: any = null;
 
-    if (!token) {
-      res.status(404).json({ error: 'Token not found' });
+    const transaction = db.transaction(() => {
+      const token = db.prepare(`
+        SELECT id, status, counter_id, service_id FROM tokens WHERE id = ? AND student_id = ?
+      `).get(tokenId, user.id) as any;
+
+      if (!token) {
+        errorMessage = 'Token not found';
+        statusCode = 404;
+        return;
+      }
+
+      if (token.status !== 'WAITING' && token.status !== 'HELD') {
+        errorMessage = `Cannot cancel token with status: ${token.status}`;
+        statusCode = 400;
+        return;
+      }
+
+      const updateRes = db.prepare(`
+        UPDATE tokens 
+        SET status = 'CANCELLED', completed_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status IN ('WAITING', 'HELD')
+      `).run(tokenId);
+
+      if (updateRes.changes === 0) {
+        errorMessage = 'Failed to cancel token: State changed concurrently';
+        statusCode = 400;
+        return;
+      }
+
+      cancelledToken = token;
+    }).immediate;
+
+    transaction();
+
+    if (errorMessage) {
+      res.status(statusCode).json({ error: errorMessage });
       return;
     }
 
-    if (token.status !== 'WAITING' && token.status !== 'HELD') {
-      res.status(400).json({ error: `Cannot cancel token with status: ${token.status}` });
-      return;
-    }
-
-    db.prepare(`
-      UPDATE tokens 
-      SET status = 'CANCELLED', completed_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(tokenId);
-
-    if (token.counter_id && token.service_id) {
-       socketService.emitQueueUpdated(token.service_id, { counterId: token.counter_id });
+    if (cancelledToken?.counter_id && cancelledToken?.service_id) {
+       socketService.emitQueueUpdated(cancelledToken.service_id, { counterId: cancelledToken.counter_id });
     }
 
     res.json({ success: true, message: 'Token cancelled successfully' });
-  } catch (err) {
+  } catch (err: any) {
     console.error('Error cancelling token:', err);
-    res.status(500).json({ error: 'Failed to cancel token' });
+    res.status(500).json({ error: err.message || 'Failed to cancel token' });
   }
 });
 

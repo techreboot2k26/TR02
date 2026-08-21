@@ -294,7 +294,7 @@ export class DefaultQueueEngine implements IQueueEngine {
       );
 
       createdToken = db.prepare('SELECT * FROM tokens WHERE id = ?').get(id) as TokenRecord;
-    });
+    }).immediate;
 
     transaction();
 
@@ -337,14 +337,20 @@ export class DefaultQueueEngine implements IQueueEngine {
         return;
       }
 
-      db.prepare(`
+      const now = new Date().toISOString();
+      const updateRes = db.prepare(`
         UPDATE tokens
-        SET status = 'CANCELLED'
-        WHERE id = ?
-      `).run(tokenId);
+        SET status = 'CANCELLED', completed_at = ?
+        WHERE id = ? AND status IN ('WAITING', 'HELD')
+      `).run(now, tokenId);
+
+      if (updateRes.changes === 0) {
+        errorMessage = 'Failed to cancel token: Token state changed concurrently.';
+        return;
+      }
 
       resultToken = db.prepare('SELECT * FROM tokens WHERE id = ?').get(tokenId) as TokenRecord;
-    });
+    }).immediate;
 
     transaction();
 
@@ -361,18 +367,20 @@ export class DefaultQueueEngine implements IQueueEngine {
   callNextToken(serviceId: string, counterId: string): QueueEngineResult {
     const db = getDb();
 
-    const counter = db.prepare('SELECT status FROM counters WHERE id = ?').get(counterId) as any;
-    if (!counter) {
-      return { success: false, error: 'Counter not found' };
-    }
-    if (counter.status !== 'OPEN') {
-      return { success: false, error: `Cannot call next token: Counter is currently ${counter.status}` };
-    }
-
     let resultToken: TokenRecord | null = null;
     let errorMessage: string | null = null;
 
     const transaction = db.transaction(() => {
+      const counter = db.prepare('SELECT status FROM counters WHERE id = ?').get(counterId) as any;
+      if (!counter) {
+        errorMessage = 'Counter not found';
+        return;
+      }
+      if (counter.status !== 'OPEN') {
+        errorMessage = `Cannot call next token: Counter is currently ${counter.status}`;
+        return;
+      }
+
       const activeServing = db.prepare(`
         SELECT * FROM tokens WHERE counter_id = ? AND status = 'SERVING'
       `).get(counterId) as TokenRecord | undefined;
@@ -382,22 +390,33 @@ export class DefaultQueueEngine implements IQueueEngine {
         return;
       }
 
-      const nextToken = this.getNextEligibleToken(serviceId);
-      if (!nextToken) {
+      const candidateTokens = getSortedWaitingTokens(serviceId);
+      if (!candidateTokens || candidateTokens.length === 0) {
         errorMessage = 'Waiting queue is currently empty for this service.';
         return;
       }
 
       const now = new Date().toISOString();
 
-      db.prepare(`
-        UPDATE tokens
-        SET status = 'SERVING', counter_id = ?, started_at = ?
-        WHERE id = ? AND status = 'WAITING'
-      `).run(counterId, now, nextToken.id);
+      // Atomically claim the top eligible waiting token
+      for (const candidate of candidateTokens) {
+        const updateRes = db.prepare(`
+          UPDATE tokens
+          SET status = 'SERVING', counter_id = ?, started_at = ?
+          WHERE id = ? AND status = 'WAITING'
+        `).run(counterId, now, candidate.id);
 
-      resultToken = db.prepare('SELECT * FROM tokens WHERE id = ?').get(nextToken.id) as TokenRecord;
-    });
+        if (updateRes.changes > 0) {
+          resultToken = db.prepare('SELECT * FROM tokens WHERE id = ?').get(candidate.id) as TokenRecord;
+          break;
+        }
+      }
+
+      if (!resultToken) {
+        errorMessage = 'Waiting queue is currently empty for this service.';
+        return;
+      }
+    }).immediate;
 
     transaction();
 
@@ -439,14 +458,19 @@ export class DefaultQueueEngine implements IQueueEngine {
 
       const now = new Date().toISOString();
 
-      db.prepare(`
+      const updateRes = db.prepare(`
         UPDATE tokens
         SET status = 'COMPLETED', completed_at = ?
-        WHERE id = ? AND status = 'SERVING'
-      `).run(now, tokenId);
+        WHERE id = ? AND status = 'SERVING' AND counter_id = ?
+      `).run(now, tokenId, counterId);
+
+      if (updateRes.changes === 0) {
+        errorMessage = 'State transition failed: Token is no longer in SERVING status for this counter.';
+        return;
+      }
 
       resultToken = db.prepare('SELECT * FROM tokens WHERE id = ?').get(tokenId) as TokenRecord;
-    });
+    }).immediate;
 
     transaction();
 
@@ -481,14 +505,19 @@ export class DefaultQueueEngine implements IQueueEngine {
 
       const now = new Date().toISOString();
 
-      db.prepare(`
+      const updateRes = db.prepare(`
         UPDATE tokens
         SET status = 'HELD', held_at = ?
-        WHERE id = ? AND status = 'SERVING'
-      `).run(now, tokenId);
+        WHERE id = ? AND status = 'SERVING' AND counter_id = ?
+      `).run(now, tokenId, counterId);
+
+      if (updateRes.changes === 0) {
+        errorMessage = 'State transition failed: Token is no longer in SERVING status for this counter.';
+        return;
+      }
 
       resultToken = db.prepare('SELECT * FROM tokens WHERE id = ?').get(tokenId) as TokenRecord;
-    });
+    }).immediate;
 
     transaction();
 
@@ -527,14 +556,19 @@ export class DefaultQueueEngine implements IQueueEngine {
 
       const now = new Date().toISOString();
 
-      db.prepare(`
+      const updateRes = db.prepare(`
         UPDATE tokens
         SET status = 'SERVING', counter_id = ?, started_at = ?
         WHERE id = ? AND status = 'HELD'
       `).run(counterId, now, tokenId);
 
+      if (updateRes.changes === 0) {
+        errorMessage = 'State transition failed: Token is no longer in HELD status.';
+        return;
+      }
+
       resultToken = db.prepare('SELECT * FROM tokens WHERE id = ?').get(tokenId) as TokenRecord;
-    });
+    }).immediate;
 
     transaction();
 
@@ -564,14 +598,19 @@ export class DefaultQueueEngine implements IQueueEngine {
 
       const now = new Date().toISOString();
 
-      db.prepare(`
+      const updateRes = db.prepare(`
         UPDATE tokens
         SET status = 'SKIPPED', skipped_at = ?
-        WHERE id = ?
+        WHERE id = ? AND status IN ('SERVING', 'HELD', 'WAITING')
       `).run(now, tokenId);
 
+      if (updateRes.changes === 0) {
+        errorMessage = `Invalid state transition: Cannot skip token with status '${token.status}'.`;
+        return;
+      }
+
       resultToken = db.prepare('SELECT * FROM tokens WHERE id = ?').get(tokenId) as TokenRecord;
-    });
+    }).immediate;
 
     transaction();
 
@@ -588,12 +627,13 @@ export class DefaultQueueEngine implements IQueueEngine {
     let resultToken: TokenRecord | null = null;
     let errorMessage: string | null = null;
 
-    const counter = db.prepare('SELECT status FROM counters WHERE id = ?').get(counterId) as any;
-    if (!counter || counter.status !== 'OPEN') {
-      return { success: false, error: 'Counter is not OPEN' };
-    }
-
     const transaction = db.transaction(() => {
+      const counter = db.prepare('SELECT status FROM counters WHERE id = ?').get(counterId) as any;
+      if (!counter || counter.status !== 'OPEN') {
+        errorMessage = 'Counter is not OPEN';
+        return;
+      }
+
       const activeServing = db.prepare(`
         SELECT * FROM tokens WHERE counter_id = ? AND status = 'SERVING'
       `).get(counterId) as TokenRecord | undefined;
@@ -603,22 +643,32 @@ export class DefaultQueueEngine implements IQueueEngine {
         return;
       }
 
-      const nextToken = this.getNextEligibleToken(serviceId);
-      if (!nextToken) {
+      const candidateTokens = getSortedWaitingTokens(serviceId);
+      if (!candidateTokens || candidateTokens.length === 0) {
         errorMessage = 'No eligible tokens found in waitlist';
         return;
       }
 
       const now = new Date().toISOString();
 
-      db.prepare(`
-        UPDATE tokens
-        SET status = 'SERVING', counter_id = ?, started_at = ?
-        WHERE id = ? AND status = 'WAITING'
-      `).run(counterId, now, nextToken.id);
+      for (const candidate of candidateTokens) {
+        const updateRes = db.prepare(`
+          UPDATE tokens
+          SET status = 'SERVING', counter_id = ?, started_at = ?
+          WHERE id = ? AND status = 'WAITING'
+        `).run(counterId, now, candidate.id);
 
-      resultToken = db.prepare('SELECT * FROM tokens WHERE id = ?').get(nextToken.id) as TokenRecord;
-    });
+        if (updateRes.changes > 0) {
+          resultToken = db.prepare('SELECT * FROM tokens WHERE id = ?').get(candidate.id) as TokenRecord;
+          break;
+        }
+      }
+
+      if (!resultToken) {
+        errorMessage = 'No eligible tokens found in waitlist';
+        return;
+      }
+    }).immediate;
 
     transaction();
 

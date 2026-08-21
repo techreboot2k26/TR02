@@ -82,7 +82,7 @@ def book_token(
             VALUES (?, ?, ?, ?, ?, ?, ?, 'WAITING', ?);
         """, (token_id, token_number, user_id, user_name, user_email, service_id, counter_id, created_at_val))
 
-        db.commit()
+        db.execute("COMMIT;")
 
         # 6. Retrieve complete token details (including names) for response payload
         cursor.execute("""
@@ -101,10 +101,16 @@ def book_token(
         return new_token
 
     except HTTPException:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise
     except sqlite3.Error as e:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database transaction error: {str(e)}"
@@ -175,10 +181,11 @@ def get_token_history(db: sqlite3.Connection, user_id: str) -> list:
 def cancel_token(db: sqlite3.Connection, user_id: str, token_id: str) -> dict:
     """
     Cancels a student's active waiting or held token.
-    Enforces ownership and state transitions.
+    Enforces ownership and state transitions inside an immediate transaction.
     """
     cursor = db.cursor()
     try:
+        db.execute("BEGIN IMMEDIATE;")
         # Fetch token to verify existence and check details
         cursor.execute("""
             SELECT student_id, status, counter_id, service_id, token_number
@@ -211,9 +218,16 @@ def cancel_token(db: sqlite3.Connection, user_id: str, token_id: str) -> dict:
         cursor.execute("""
             UPDATE tokens 
             SET status = 'CANCELLED', completed_at = CURRENT_TIMESTAMP
-            WHERE id = ?;
+            WHERE id = ? AND status IN ('WAITING', 'HELD');
         """, (token_id,))
-        db.commit()
+        
+        if cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to cancel token: State changed concurrently"
+            )
+            
+        db.execute("COMMIT;")
         
         return {
             "success": True,
@@ -227,10 +241,16 @@ def cancel_token(db: sqlite3.Connection, user_id: str, token_id: str) -> dict:
         }
         
     except HTTPException:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise
     except sqlite3.Error as e:
-        db.rollback()
+        try:
+            db.execute("ROLLBACK;")
+        except Exception:
+            pass
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database mutation error: {str(e)}"
